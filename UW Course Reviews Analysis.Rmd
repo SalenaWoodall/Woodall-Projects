@@ -1,0 +1,450 @@
+---
+title: "Waterloo Course Reviews"
+author: "Salena Woodall"
+date: "2022-11-30"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(RCurl) ## API Calls
+library(data.table) ## For %like% function
+
+## For corpus creation
+library(stringr)
+#library(bitops)
+library(NLP)
+library(tm)
+## SVM and Naive Bayes set up
+library(parsnip)
+library(recipes)
+library(textrecipes)
+library(workflows)
+library(discrim)
+library(kknn)
+library(rsample) # used for v-fold CV
+library(tune)
+## SVM
+library(e1071)
+library(yardstick) # Needed for conf_mat()
+## Other
+library(forcats) #Used for plotting tf_idf
+library(ggplot2) #Nice plotting
+library(gridExtra) #Used for plotting side by side
+library(spacyr) #Used for tokenizing, lemma
+library(viridis) #Color-blind pallet
+library(stringi) #Replace mis-spelled words
+library(tidytext) #Used for tokenizinng and stopwords
+## Dendrogram plot
+library(textstem)
+library(factoextra)
+library(dendextend)
+library(RColorBrewer)
+```
+
+## Clean and make a corpus
+
+```{r}
+dat <- read.csv("Waterloo_course_reviews.csv", header = T)
+# head(dat)
+
+dat <- dat%>%select(course_title, useful, easy, liked, reviews, course_rating, course_rating_int)
+dat <- na.omit(dat)
+
+# Remove % from useful, easy and liked
+dat$useful <- as.numeric(gsub("%$", "", dat$useful))
+dat$easy <- as.numeric(gsub("%$", "", dat$easy))
+dat$liked <- as.numeric(gsub("%$", "", dat$liked))
+dat <- na.omit(dat)
+```
+
+
+```{r}
+number_reviews <- count(dat, course_title)
+dat%>%select(course_title, useful, easy, liked)%>%
+  group_by(course_title)%>%
+  arrange(desc(liked))%>%
+  left_join(number_reviews)%>%
+  distinct()%>%print(n=Inf)
+```
+
+
+```{r}
+clean_dat <- dat
+clean_dat$reviews <- tolower(clean_dat$reviews) # Lowercase
+clean_dat$reviews <- gsub("[[:punct:]]", "", clean_dat$reviews) # Remove punctuation
+#clean_dat$reviews <- gsub("[[:digit:]]", "", clean_dat$reviews) # Remove numbers
+clean_dat$reviews <- gsub("\\s+", " ", str_trim(clean_dat$reviews)) # Remove extra white-spaces
+clean_dat$reviews <- stri_trans_general(clean_dat$reviews, "latin-ascii")  # Remove non-english words
+
+empty_rev <- which(clean_dat$reviews=="")
+clean_dat <- clean_dat[-c(12934,13386,empty_rev,14438), ] # Remove xxdddddddddddddddddddddddddddddddddddddd
+
+# Correct spelling
+mis_spell <- c('eng', 'uw','uwateloo','tbh','ez','ur',
+               'demo','ui','hs','os','lmao',
+               'vs','ml','idk','gg','avg','af','hw',
+               'ai','f2020','f18','w21','econ101',
+               'cs241','cs341','cs245', 'afm433', 'acc685', 'afm291', 'afm191', 'afm101', 'afm424', 'afm491',
+               'stat230','btw','uc++','prof','oh','8:30am', 'hrs',
+               'afm373', 'afmers', "hws", "babyyyyy", "\\dhr", "profs", 
+               "https://www.urbandictionary.com/define.php?term=Vague%20Arts", "https://quizlet.com/join/KG2c2wkJK", 
+               "http://www.khanacademy.org/math/differential-equations/v/laplace-transform-1", 
+               "http://en.wikipedia.org/wiki/Coq", "cs", "dont", "doesnt", "calc", "didnt", "isnt", "wtf")
+mis_spell <- paste0("\\b", mis_spell, "\\b")
+cor_spell <- c("english", "university of waterloo", "university of waterloo", "to be honest","easy","your",
+               "demonstration","user interface","high school","operating system","laughing my ass off",
+               "versus","machine learning","i do not know","good game","average","as fuck","home work",
+               "artificial intelligence","fall 2020", "fall 2018","winter 2021","econ 101",
+               "cs 241","cs 341","cs 245", "afm 433", "acc 685", "afm 291", 'afm 191', 'afm 101', "afm 424",'afm491',
+               "stat 230","by the way","c++","professor","office hour","eight thirty am", "hours", 
+               "afm 373","afm students", "home works", "baby", "hour", "professors", "urban dictionary", "quizlet",
+               "khan acadeny", 
+               "wikipedia", "computer science", "do not", "does not", "calculus", "did not", "is not", "what the fuck")
+clean_dat$reviews <- stri_replace_all_regex(clean_dat$reviews, mis_spell, cor_spell, vectorise_all = FALSE)
+# Remove " and -
+clean_dat <- clean_dat%>%
+  mutate(doc_id = paste0("doc", row_number()),
+         reviews = str_replace_all(reviews, '"', " "),
+         reviews = str_replace_all(reviews, '-', " "))
+# Text to remove
+remove_words <- c("<NA>","10k", "10th","13rd", "20th","80s90", "😭",
+                  "http://i.imgur.com/Ljt9J.jpg","https://www.reddit.com/r/uwaterloo/comments/wh0xjv/cs_348_watch_the_movie_inside_out/","https://www.reddit.com/r/uwaterloo/comments/wgyyfx/wtf_was_that_entire_cs_348_course/","https://www.reddit.com/r/uwaterloo/comments/wgzp9d/posted_in_cs348_piazza/", "https://uwaterloo.ca/scholar/by2lee/ece-106","https://courseware.cemc.uwaterloo.ca/", "http://prilik.ca/mips241", "http://www.cis.upenn.edu/~bcpierce/sf/current/deps.html","\\bie\\b", "i.e.")
+remove_words <- paste0("\\b", remove_words, "\\b")
+
+clean_dat$reviews <- stri_replace_all_regex(clean_dat$reviews, remove_words, "", vectorise_all = FALSE)
+```
+
+Scatter plot of *useful* VS *easy* grouped by course.
+
+```{r}
+p1 <- clean_dat%>%select(course_title, useful, easy, liked)%>%
+  group_by(course_title)%>%
+  ggplot(aes(x=useful, y=easy))+
+  geom_point(color="#30123BFF")
+p2 <- clean_dat%>%select(course_title, useful, easy, liked)%>%
+  group_by(course_title)%>%
+  ggplot(aes(x=useful, y=liked))+
+  geom_point(color="#FABA39FF")
+p3 <- clean_dat%>%select(course_title, useful, easy, liked)%>%
+  group_by(course_title)%>%
+  ggplot(aes(x=easy, y=liked))+
+  geom_point(color="#7A0403FF") 
+grid.arrange(p1, p2, p3, ncol=3)
+```
+
+Histogram of *useful*, *easy*, *liked* grouped by course.
+
+```{r}
+p1 <- clean_dat%>%select(course_title, useful, easy, liked)%>%
+  group_by(course_title)%>%
+  distinct()%>%
+  ggplot(aes(x=useful))+
+  geom_histogram(fill="#30123BFF", bins=50)
+p2 <- clean_dat%>%select(course_title, useful, easy, liked)%>%
+  group_by(course_title)%>%
+  distinct()%>%
+  ggplot(aes(x=easy))+
+  geom_histogram(fill="#FABA39FF", bins=50)
+p3 <- clean_dat%>%select(course_title, useful, easy, liked)%>%
+  group_by(course_title)%>%
+  distinct()%>%
+  ggplot(aes(x=liked))+
+  geom_histogram(fill="#7A0403FF", bins=50)
+grid.arrange(p1, p2, p3, ncol=3)
+```
+
+Histogram of the number of words for each review.
+
+```{r}
+number_words <- sapply(gregexpr("[[:alpha:]]+", clean_dat$reviews), function(x) sum(x > 0))
+number_words <- data.frame(words=number_words)
+ggplot(number_words, aes(words))+
+  geom_histogram(binwidth = 1, fill="#3366FF")+
+  labs(title="Number of Words in Course Reviews", x="Number of Words", y="Frequency")+
+  geom_segment(aes(x=750,y=30,xend=750,yend=5))+
+  ggplot2::annotate("text", x=750, y=35, label="750")+
+  geom_segment(aes(x=11,y=330,xend=30,yend=330))+
+  ggplot2::annotate("text", x=40, y=330, label="8")
+# sort(table(number_words$words), decreasing = TRUE)[1:3]
+```
+
+
+## Word frequencies
+
+```{r}
+# Using spacy
+## Tokenize words
+# We want to remove "stop words": "the" "of" "and"
+
+spacy_initialize(model = "en_core_web_sm")
+
+spacy_rev <- clean_dat%>%
+  rename(text=reviews)%>%
+  select(doc_id, text)%>%
+  spacy_parse()%>%
+  filter(!pos %in% c("SPACE", "PUNCT", "PRON", "DET", "CCONJ", "AUX", "NUM"))%>%
+  filter(str_detect(lemma, "'d", negate = TRUE)) %>%
+  mutate(lemma = str_to_lower(lemma)) %>%
+  anti_join(get_stopwords(), by = c("lemma" = "word"))%>%
+  rename(word=lemma)
+
+lemma_rev <- spacy_rev%>%select(doc_id, word)
+rev_text <- clean_dat%>%
+  left_join(lemma_rev)
+# Remove periods and empty strings
+rev_text <- rev_text%>%mutate(word=str_replace_all(word, "\\.", ""))
+
+rev_text$word <- stri_replace_all_regex(rev_text$word, "oop", "coop", vectorise_all = FALSE)
+```
+
+```{r}
+# Overall word frequencies
+rev_text %>%
+  count(word, sort = TRUE) %>%
+  filter(n > 1400) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word, fill=n)) +
+  labs(title = "Overall Word Frequencies", x="Frequency")+
+  geom_col(show.legend = FALSE) +
+  scale_fill_viridis(option = "H")+
+  labs(y = NULL)
+```
+
+
+```{r}
+# Sentiments (liked, dis-liked)
+course_words <- rev_text%>%
+  count(course_rating, word, sort=TRUE)%>%
+  bind_tf_idf(word, course_rating, n)%>%
+  arrange(desc(tf_idf))%>%
+  mutate(word=str_replace_all(word, "\\.", ""))
+
+course_words %>%
+  group_by(course_rating) %>%
+  top_n(15) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, fct_reorder(word, tf_idf), fill = course_rating)) +
+  scale_fill_manual(values=viridis_pal(direction=-1,option = "H")(2))+
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~course_rating, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title = "Overall TF-IDF")
+
+#dat%>%filter(grepl('coq', reviews)) code to find reviews with "coq"
+```
+
+## Bi-gram
+
+```{r}
+course_bigram <- clean_dat %>%
+  unnest_tokens(bigram, reviews, token="ngrams", n=2)%>%
+  filter(!is.na(bigram))%>%
+  separate(bigram, c("word1", "word2"), sep = " ")%>%
+  filter(!word1 %in% stop_words$word) %>%
+  filter(!word2 %in% stop_words$word)%>%
+  unite(bigram, word1, word2, sep = " ")
+
+# course_bigram
+bigram_tf_idf <- course_bigram %>%
+  count(course_rating, bigram) %>%
+  bind_tf_idf(bigram, course_rating, n) %>%
+  arrange(desc(tf_idf))
+
+bigram_tf_idf %>%
+  group_by(course_rating) %>%
+  slice_max(tf_idf, n = 15) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, fct_reorder(bigram, tf_idf), fill = course_rating)) +
+  scale_fill_manual(values=viridis_pal(direction=-1,option = "H")(2))+
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~course_rating, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title = "TF-IDF Bi-gram")
+```
+
+## Clustering
+
+```{r}
+# Create a corpus
+dat_format <- data.frame(doc_id=rev_text$doc_id, text=rev_text$reviews) # Wants data in form (doc_id, text)
+clean_corpus <- Corpus(DataframeSource(dat_format))
+clean_corpus <- tm_map(clean_corpus, removeWords, stopwords('english')) # Removing stop-words
+clean_corpus <- tm_map(clean_corpus, removeNumbers)
+clean_corpus<- tm_map(clean_corpus, stemDocument, language = "english") # Stemming the words  
+clean_corpus <- tm_map(clean_corpus, stripWhitespace) # Trimming excessive whitespaces
+#lem_corpus <- lemmatize_words(clean_corpus)
+
+corpus_tdm <- DocumentTermMatrix(clean_corpus, control = list(minWordLength = 1, 
+                                                            weighting = function(x) weightTfIdf(x, normalize = FALSE), 
+                                                            stopwords = TRUE))
+#corpus_tfidf <- weightTfIdf(corpus_tdm)
+
+corpus_tfidf <- removeSparseTerms(corpus_tdm, 0.90) 
+tfidf.matrix <- t(as.matrix(corpus_tfidf))
+
+# Cosine distance matrix (useful for specific clustering algorithms) 
+dist.matrix = proxy::dist(scale(tfidf.matrix), method = "cosine")
+```
+
+```{r}
+rev_dend <- as.dendrogram(hclust(dist.matrix, method = "ward.D2"))
+```
+
+hierarchical clustering
+
+
+```{r}
+fviz_dend(rev_dend, cex=0.8, k=7, k_colors = viridis_pal(option = "D")(7), color_labels_by_k = TRUE, 
+          main = "Dendrogram of Hierarchical Clustering", xlab = "Words", ylab = "Cosine Similarity", 
+          sub="", horiz = TRUE, ggtheme = theme_classic(base_family = "StaffMeetingPlain"))
+```
+
+## More pre-processing: Only want course title, useful, easy, liked, reviews, course_rating, and word
+## SVM and Naive Bayes set up
+
+```{r}
+set.seed(33)
+#create training and testing set
+text_docs <- lemma_rev%>% 
+  group_by(doc_id)%>%
+  summarise(text=paste0(word, collapse = " "))%>%ungroup()
+rev_text <- rev_text%>%
+  select(-reviews, -word)%>%
+  left_join(text_docs)%>%
+  select(-doc_id)%>%
+  distinct()
+  
+reviews <- rev_text%>%mutate(id=row_number(), rating=factor(course_rating))%>%
+  select(id, rating, text)
+rev_train <- sample_frac(reviews, 0.8)# 80% of the sample
+rev_test <- reviews %>% anti_join(rev_train)
+
+# Wanted to use cross validation folds, but it was too computationally expensive for my computer.
+#review_folds <- vfold_cv(rev_train, v=100)
+
+# Pre-processing Specification
+train_recipe <- recipe(rating~., data = rev_train) %>% 
+  update_role(id, new_role = "ID") %>% 
+  step_tokenize(text, token = "ngrams", options=list(n=2, n_min=1)) %>% 
+  step_tokenfilter(text, max_tokens = 100, min_times = 10) %>%
+  step_tfidf(text)
+```
+
+```{r}
+text_model_NB_spec <- naive_Bayes() %>% 
+  set_engine("naivebayes") %>% 
+  set_mode("classification")
+text_model_svm_spec <- svm_poly()%>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+text_model_knn_spec <- nearest_neighbor(neighbors = 30) %>% #30 was best
+  set_engine("kknn")%>% 
+  set_mode("classification")
+```
+
+```{r}
+text_model_NB <- workflows::workflow() %>% add_recipe(train_recipe) %>% add_model(text_model_NB_spec)
+text_model_svm <- workflows::workflow()%>% add_recipe(train_recipe)%>% add_model(text_model_svm_spec)
+text_model_knn <- workflows::workflow() %>% add_recipe(train_recipe) %>% add_model(text_model_knn_spec)
+```
+
+### Support Vector Machine SVM
+
+```{r}
+##### Crash two computers
+# doParallel::registerDoParallel()
+# set.seed(33)
+# # tune hyper-parameters using cross validation
+# review_tune_svm <- tune_grid(text_model_svm, review_folds, grid = 10, metrics = metric_set(roc_auc, accuracy))
+
+# Best SVM
+# best_SVM_acc <- review_tune_svm%>%select_best("accuracy")
+# 
+# # Final SVM workflow
+# final_SVM_wf <- finalize_workflow(text_model_svm, best_SVM_acc)
+```
+
+
+```{r}
+svm_model <- fit(text_model_svm, rev_train)
+svm_preds <- predict(svm_model, rev_test)
+
+bind_cols(rev_test,svm_preds) %>% conf_mat(rating, .pred_class) 
+bind_cols(rev_test,svm_preds) %>% accuracy(truth = rating, estimate = .pred_class)
+```
+
+
+## Naive Bayes
+
+```{r}
+# doParallel::registerDoParallel()
+# set.seed(33)
+# # tune hyper-parameters using cross validation
+# review_tune_nb <- tune_grid(text_model_NB, review_folds, grid = 20, metrics = metric_set(roc_auc, accuracy))
+```
+
+```{r}
+# # Best Naive Bayes
+# best_NB_acc <- review_tune_nb%>%select_best("accuracy")
+# 
+# # Final Naive Bayes workflow
+# final_NB_wf <- finalize_workflow(text_model_NB, best_NB_acc)
+```
+
+```{r}
+NB_model <- fit(text_model_NB, rev_train)
+NB_preds <- predict(NB_model, rev_test)
+
+bind_cols(rev_test,NB_preds) %>% conf_mat(rating, .pred_class) 
+bind_cols(rev_test,NB_preds) %>% accuracy(truth = rating, estimate = .pred_class)
+```
+
+
+## K-Nearest Neighbors
+
+```{r}
+# doParallel::registerDoParallel()
+# set.seed(33)
+# # tune hyper-parameters using cross validation
+# review_tune_knn <- tune_grid(text_model_knn, review_folds, grid = 20, metrics = metric_set(roc_auc, accuracy))
+```
+
+```{r}
+# # Best knn
+# best_knn_acc <- review_tune_knn%>%select_best("accuracy")
+# 
+# # Final knn workflow
+# final_knn_wf <- finalize_workflow(text_model_knn, best_knn_acc)
+```
+
+```{r}
+knn_model <- fit(text_model_knn, rev_train)
+knn_preds <- predict(knn_model, rev_test)
+
+bind_cols(rev_test,knn_preds) %>% conf_mat(rating, .pred_class)
+bind_cols(rev_test,knn_preds) %>% accuracy(truth = rating, estimate = .pred_class)
+```
+
+
+## Comparison using ROC
+
+```{r}
+svm_pred_prob <- predict(svm_model, rev_test, type="prob")
+nb_pred_prob <- predict(NB_model, rev_test, type="prob")
+knn_pred_prob <- predict(knn_model, rev_test, type="prob")
+
+roc_SVM <-  bind_cols(rev_test,svm_pred_prob) %>% roc_curve(rating, `.pred_disliked course`) %>% mutate(Model="SVM")
+roc_NB <- bind_cols(rev_test,nb_pred_prob) %>% roc_curve(rating, `.pred_disliked course`) %>% mutate(Model="Naive Bates")
+roc_knn <- bind_cols(rev_test,knn_pred_prob) %>% roc_curve(rating, `.pred_disliked course`) %>% mutate(Model="k-NN") 
+
+# Receiver Operator curve comparing SVM, kNN and naive bayes without hyperparameter tuning
+bind_rows(roc_NB, roc_SVM, roc_knn) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color=Model)) + 
+  geom_path() + geom_abline(lty = 3) + 
+  scale_color_manual(values = c("#30123BFF", "#FABA39FF", "#7A0403FF"))+
+  coord_equal() + theme_bw() + 
+  ggtitle("ROC SVM vs kNN vs Naive bayes") 
+```
+
+
+
